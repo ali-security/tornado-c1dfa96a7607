@@ -276,6 +276,9 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
     # implementation asks for brotli, so this is only true where the client
     # decodes an encoding it did not request (see BrotliBombHandler).
     decompresses_brotli = False
+    # Set by subclasses whose client accepts obsolete line folding in
+    # response headers (see test_multi_line_headers).
+    supports_line_folding = False
 
     def get_app(self):
         return Application(
@@ -750,8 +753,19 @@ Transfer-Encoding: chunked
                 )
 
     def test_multi_line_headers(self):
-        # Multi-line http headers are rare but rfc-allowed
-        # http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.2
+        # Line folding is an obsolete way of representing headers split across multiple lines.
+        # https://www.rfc-editor.org/info/rfc9112/#section-5.2
+        #
+        # They must either be folded into a single line or rejected.
+        # Tornado 6.6 removed support for line folding in simple_httpclient, but they are
+        # still supported in libcurl.
+        supports_line_folding = self.supports_line_folding
+        if type(self.http_client).__name__ == "CurlAsyncHTTPClient":
+            # This class also runs on its own with the default client, which is
+            # curl_httpclient under --httpclient (see runtests.py).
+            from tornado.test.curl_httpclient_test import CurlHTTPClientCommonTestCase
+
+            supports_line_folding = CurlHTTPClientCommonTestCase.supports_line_folding
         sock, port = bind_unused_port()
         with closing(sock):
 
@@ -775,9 +789,16 @@ X-XSS-Protection: 1;
 
             netutil.add_accept_handler(sock, accept_callback)  # type: ignore
             try:
-                resp = self.fetch("http://127.0.0.1:%d/" % port)
-                resp.rethrow()
-                self.assertEqual(resp.headers["X-XSS-Protection"], "1; mode=block")
+                if supports_line_folding:
+                    resp = self.fetch("http://127.0.0.1:%d/" % port)
+                    resp.rethrow()
+                    self.assertEqual(resp.headers["X-XSS-Protection"], "1; mode=block")
+                else:
+                    with ExpectLog(
+                        gen_log, "Malformed HTTP message.*folding", level=logging.INFO
+                    ):
+                        with self.assertRaises(HTTPError):
+                            self.fetch("http://127.0.0.1:%d/" % port, raise_error=True)
             finally:
                 self.io_loop.remove_handler(sock.fileno())
 
